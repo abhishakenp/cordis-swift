@@ -177,6 +177,7 @@ import Cordis
 | `provide(_ name:, _ handler: (method, args) -> Value) -> CordisHandle` | Host service. Plugins that inject `name` become applicable. |
 | `call(_ service:, _ method:, _ args:) -> Value` | Call a host or plugin service. Failures come back as `{"error": "..."}`. |
 | `on(_ event:, _ handler:) -> CordisHandle`, `emit(_:_:)` | Event bus shared by host and plugins. |
+| `hasListeners(_ event:)` | True when the host or any plugin listens to the event. |
 | `timer(milliseconds:repeats:_:) -> CordisHandle` | Main-queue timer. |
 | `dispose(_ handle:)` | Remove any registration. Removing a service cascades to its dependents. |
 | `load(_ path:) throws -> PluginInfo` | Load a dylib and apply it when its injections exist. |

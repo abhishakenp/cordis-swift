@@ -170,6 +170,11 @@ public final class PluginHost {
     addListener(owner: nil, event: event, target: .host(handler))
   }
 
+  /// True when the host or any plugin listens to `event`.
+  public func hasListeners(_ event: String) -> Bool {
+    listeners[event]?.contains { registrations[$0.handle] != nil } ?? false
+  }
+
   public func emit(_ event: String, _ payload: Value = .null) {
     guard let ls = listeners[event], !ls.isEmpty else { return }
     var encoded: [UInt8]?

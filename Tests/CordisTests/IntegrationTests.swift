@@ -36,9 +36,12 @@ struct IntegrationTests {
     var pongs: [Value] = []
     var seen: [Value] = []
     var changed: [Value] = []
+    #expect(host.hasListeners("greeter/ping"))  // registered by the greeter plugin
+    #expect(!host.hasListeners("greeter/pong"))
     host.on("greeter/pong") { pongs.append($0) }
     host.on("greeter/seen") { seen.append($0) }
     let h = host.on("counter/changed") { changed.append($0) }
+    #expect(host.hasListeners("greeter/pong"))
 
     host.emit("greeter/ping", ["tab": 7])
     #expect(pongs == [["tab": 7]])
