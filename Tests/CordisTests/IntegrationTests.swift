@@ -122,6 +122,38 @@ struct IntegrationTests {
     host.unloadAll()
   }
 
+  /// Two consumers of one provider: deactivating the second removes its service, which used to
+  /// reconcile and re-apply the first while the provider was still registered but about to be
+  /// (or already) disposed, so a consumer could call into a disposed plugin.
+  @Test func unloadAppliesNothingUntilTheProviderIsGone() throws {
+    let (host, log) = makeHost()
+    try host.load(Fixtures.path("counter"))
+    try host.load(Fixtures.path("greeter"))
+    try host.load(Fixtures.path("watcher"))
+    #expect(host.plugin("watcher")?.state == .active && host.plugin("greeter")?.state == .active)
+
+    log.events = []
+    let report = try host.unload("counter")
+    let applied = log.events.compactMap { if case let .applied(id) = $0 { id } else { nil } }
+    #expect(applied.isEmpty)
+    #expect(Set(report.cascaded) == ["greeter", "watcher"])
+    #expect(host.plugin("greeter")?.state == .pending(missing: ["counter"]))
+    #expect(host.plugin("watcher")?.state == .pending(missing: ["counter"]))
+
+    // Same through reload: the consumers come back once, after the new provider is applied.
+    try host.load(Fixtures.path("counter"))
+    #expect(host.plugin("watcher")?.state == .active && host.plugin("greeter")?.state == .active)
+    log.events = []
+    let path = Fixtures.tempFile("counter")
+    try FileManager.default.copyItem(atPath: Fixtures.path("counter-v2"), toPath: path)
+    try host.unload("counter")
+    log.events = []
+    try host.load(path)
+    let order = log.events.compactMap { if case let .applied(id) = $0 { id } else { nil } }
+    #expect(order.first == "counter" && Set(order) == ["counter", "greeter", "watcher"] && order.count == 3)
+    host.unloadAll()
+  }
+
   @Test func hotReloadSwapsBehavior() async throws {
     let (host, log) = makeHost()
     let dir = Fixtures.tempFile("hot")

@@ -25,6 +25,7 @@ enum Fixtures {
     Spec(name: "counter-v2", id: "counter", source: "Examples/Counter/Counter.swift", defines: ["COUNTER_V2"]),
     Spec(name: "greeter", id: "greeter", source: "Examples/Greeter/Greeter.swift", defines: []),
     Spec(name: "needy", id: "needy", source: "Tests/CordisTests/Fixtures/Needy.swift", defines: []),
+    Spec(name: "watcher", id: "watcher", source: "Tests/CordisTests/Fixtures/Watcher.swift", defines: []),
     Spec(name: "failer", id: "failer", source: "Tests/CordisTests/Fixtures/Failer.swift", defines: []),
     Spec(name: "crasher", id: "crasher", source: "Tests/CordisTests/Fixtures/Crasher.swift", defines: []),
     Spec(name: "crasher-v2", id: "crasher", source: "Tests/CordisTests/Fixtures/Crasher.swift", defines: ["CRASHER_V2"]),

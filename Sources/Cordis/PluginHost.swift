@@ -566,6 +566,13 @@ public final class PluginHost {
   }
 
   private func teardown(_ r: PluginRecord) -> UnloadReport {
+    // Nothing is applied until `r` is completely gone: while its handles are removed one by one,
+    // its services are still registered but it may already be disposed, so a dependent applied
+    // now could call into a dead plugin. Nested reconciles only mark the host dirty; `unload`
+    // and `reload` reconcile once `r` is out.
+    let outer = reconciling
+    reconciling = true
+    defer { reconciling = outer }
     let cascaded = deactivate(r)
     r.phase = .disposing
     for h in r.handles { removeRegistration(h) }
