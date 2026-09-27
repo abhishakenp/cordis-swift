@@ -124,6 +124,7 @@ public final class PluginHost {
   }
 
   /// Calls a service provided by the host or a plugin. Errors come back as `{"error": "..."}`.
+  @discardableResult
   public func call(_ service: String, _ method: String, _ args: Value = .null) -> Value {
     guard let s = services[service] else { return Self.error("service '\(service)' is not available") }
     switch s.target {
