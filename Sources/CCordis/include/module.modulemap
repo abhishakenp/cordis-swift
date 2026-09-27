@@ -1,0 +1,4 @@
+module CCordis {
+  header "cordis.h"
+  export *
+}

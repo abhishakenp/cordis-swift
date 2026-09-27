@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdlib.h>  // malloc/free: every cordis_bytes crossing the boundary is heap-owned
 
 #define CORDIS_ABI_VERSION 1
 
