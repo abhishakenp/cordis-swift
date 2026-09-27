@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SWIFT_TOOLCHAIN_VERSION: 6.3.2
+
+jobs:
+  macos:
+    name: swift test (macOS 26, arm64, Embedded Swift plugins)
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select Xcode 26
+        run: |
+          app=/Applications/Xcode_26.5.app
+          [[ -d $app ]] || app=$(printf "%s\n" /Applications/Xcode_26*.app | sort -V | tail -1)
+          sudo xcode-select -s "$app/Contents/Developer"
+          sw_vers
+          xcodebuild -version
+          swift --version
+          # Scripts/cordis-build resolves $CORDIS_TOOLCHAIN first.
+          echo "CORDIS_TOOLCHAIN=$HOME/toolchains/swift-$SWIFT_TOOLCHAIN_VERSION-RELEASE.xctoolchain" >> "$GITHUB_ENV"
+
+      - name: Cache swift.org toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains/swift-${{ env.SWIFT_TOOLCHAIN_VERSION }}-RELEASE.xctoolchain
+          key: swift-toolchain-${{ env.SWIFT_TOOLCHAIN_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      # The official swift.org .pkg, expanded without sudo; it carries the Embedded Swift stdlib.
+      - name: Install swift.org toolchain ${{ env.SWIFT_TOOLCHAIN_VERSION }}
+        run: |
+          if [[ ! -x $CORDIS_TOOLCHAIN/usr/bin/swiftc ]]; then
+            v=$SWIFT_TOOLCHAIN_VERSION tmp=$(mktemp -d)
+            curl -fsSL --retry 3 -o "$tmp/swift.pkg" \
+              "https://download.swift.org/swift-$v-release/xcode/swift-$v-RELEASE/swift-$v-RELEASE-osx.pkg"
+            pkgutil --check-signature "$tmp/swift.pkg"
+            pkgutil --expand-full "$tmp/swift.pkg" "$tmp/x"
+            mkdir -p "$(dirname "$CORDIS_TOOLCHAIN")"
+            mv "$tmp"/x/*.pkg/Payload "$CORDIS_TOOLCHAIN"
+            rm -rf "$tmp"
+          fi
+          test -d "$CORDIS_TOOLCHAIN/usr/lib/swift/embedded"
+          "$CORDIS_TOOLCHAIN/usr/bin/swiftc" --version
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ runner.arch }}-xcode26-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-${{ runner.arch }}-xcode26-
+
+      - name: swift test (includes cordis-build plugin builds)
+        run: swift test
+
+  linux:
+    # Cordis (the host) uses dlopen/MachO/CryptoKit and is macOS-only. The platform-independent
+    # targets are type-checked here: CordisValue (value + codec) and CordisKit (plugin SDK).
+    name: swift build CordisValue + CordisKit (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: swift:6.3.2-noble
+    steps:
+      - uses: actions/checkout@v5
+      - run: swift --version
+      - run: swift build --target CordisValue
+      - run: swift build --target CordisKit
