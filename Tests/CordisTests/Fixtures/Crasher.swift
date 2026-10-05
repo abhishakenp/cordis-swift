@@ -6,6 +6,8 @@
   let crasherVersion = "1.0.0"
 #endif
 
+import CCordis  // stdlib.h: mkstemp, exit
+
 nonisolated(unsafe) var depth: Int64 = 0
 
 /// Unbounded recursion: overflows the stack. The array keeps each frame alive.
@@ -39,6 +41,18 @@ func crash(_ how: String, _ arg: Int64) -> Value {
     let src: [UInt8] = [1, 2, 3, 4, 5, 6, 7, 8]
     src.withUnsafeBytes { dst.copyMemory(from: $0.baseAddress!, byteCount: 8) }
     return .null
+  case "touch":
+    // Creates a temporary file: -1 inside the pure-computation sandbox.
+    var path: [CChar] = []
+    for b in "/tmp/cordis-sandbox-XXXXXX".utf8 { path.append(CChar(bitPattern: b)) }
+    path.append(0)
+    return .int(Int64(path.withUnsafeMutableBufferPointer { mkstemp($0.baseAddress!) }))
+  case "spin":
+    // Never returns (a hung plugin).
+    while depth >= 0 { depth &+= 1 }
+    return .null
+  case "exit":
+    exit(Int32(truncatingIfNeeded: arg))
   default:
     return .string(crasherVersion)
   }

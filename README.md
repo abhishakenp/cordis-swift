@@ -44,7 +44,10 @@ and the host checks after every unload that the image is really gone. The integr
 load and unload the same plugin 25 times and assert that dyld's image count returns to the
 baseline every time.
 
-No JavaScript, no WASM, no helper processes: a plugin call is a C function call.
+No JavaScript and no WASM: a plugin call is a C function call (about 0.1 µs). A plugin that
+traps or segfaults is unloaded and the app keeps running ([crash recovery](#crash-recovery)).
+Plugins you don't trust can run in a sandboxed helper process instead, with the same API
+([out-of-process plugins](#out-of-process-plugins)).
 
 ## Requirements
 
@@ -180,12 +183,15 @@ import Cordis
 | `hasListeners(_ event:)` | True when the host or any plugin listens to the event. |
 | `timer(milliseconds:repeats:_:) -> CordisHandle` | Main-queue timer. |
 | `dispose(_ handle:)` | Remove any registration. Removing a service cascades to its dependents. |
-| `load(_ path:) throws -> PluginInfo` | Load a dylib and apply it when its injections exist. |
+| `load(_ path:, isolation:) throws -> PluginInfo` | Load a dylib and apply it when its injections exist. `isolation`: `.inProcess` (default) or `.process(sandbox:)`; reloads keep it. |
 | `unload(_ id:) throws -> UnloadReport` | Dispose (with cascade), drop handles, `dlclose`, verify unmapped. |
 | `reload(path:) -> ReloadResult` | Swap in the file's current build. `.unchanged`, `.reloaded`, or `.failed(reason:)`. |
-| `watch(_ path:)`, `unwatch(_:)` | Hot reload on file changes. |
+| `watch(_ path:, isolation:)`, `unwatch(_:)` | Hot reload on file changes. |
 | `plugins`, `plugin(_ id:)`, `serviceNames` | Introspection. `PluginState` is `.pending(missing:)`, `.active` or `.disabled(reason:)`. |
 | `lastCrash: CrashRecord?`, `clearCrashRecord()` | Crash attribution (see below). |
+| `onCrash`, `HostEvent.crashed`, `PluginHost.crashRecovery` | Crash recovery (see below). |
+| `caller: String?` | The plugin a host service or host listener is serving right now (nil for host-initiated work). Gate host services per plugin with it instead of trusting an argument. |
+| `helperExecutable`, `helperTimeout`, `helperFootprint(_:)` | Out-of-process plugins (see below). |
 | `pruneCache()` | Delete cached dylib copies that are not loaded. |
 
 ### Lifecycle and dependency rules
@@ -218,6 +224,37 @@ it is loaded, and macOS's first-`dlopen` check of a new file is paid only once p
 check was measured at 290 to 720 ms per new file on the test machine, while reopening a file
 dyld has already checked took under 1 ms.
 
+### Crash recovery
+
+Every call from the host into plugin code (a service call, an event, a timer, `apply`,
+`dispose`, reading the manifest) goes through a small C guard that records a `_setjmp` frame and
+the plugin image's `__TEXT` range. When `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGTRAP` or `SIGFPE`
+arrives on that thread, the handler checks where it happened:
+
+- **Inside the plugin's own code** (a bounds check, a force unwrap, `fatalError`, a null write, a
+  stack overflow), or inside a lock-free `libsystem_platform` routine such as `memcpy` that the
+  plugin called directly: the interrupted context is redirected to a trampoline that jumps back
+  to the guard. Returning from the handler (instead of jumping out of it) lets the kernel restore
+  the signal mask and the alternate-stack state, so the guard needs no syscall per call.
+- **Anywhere else** (host code, `malloc`, another thread): not recoverable, so the process
+  crashes and the fault is attributed as below.
+
+Recovery never skips host frames: every time host code calls into a plugin it pushes a new frame,
+so only plugin frames lie between the innermost frame and a fault in that plugin.
+
+The faulting plugin is then fenced off at once (its services return
+`{"error": "plugin 'x' crashed (SIGTRAP)"}`, its listeners and timers stop) and torn down as soon
+as no plugin code is left on the stack: plugins that inject its services are disposed normally,
+its own `dispose` is skipped (its state can't be trusted), every registration is dropped and the
+image is closed. It becomes `.disabled(reason: "crashed (SIGTRAP)")` and the host gets
+`HostEvent.crashed(CrashReport)` and `onCrash`. Loading it again works. Memory the plugin had
+allocated from `malloc` stays allocated.
+
+Tests: each fault kind above (including a stack overflow and a wild `memcpy`) in a service, an
+event listener, a timer and `apply`; 20 crashes in a row; a crash two plugins deep; the dependent
+being disposed and re-applied; a real process with the crash marker installed surviving.
+`PluginHost.crashRecovery = false` turns it off.
+
 ### Crash attribution
 
 The host keeps a pointer to the id of the plugin whose code is currently running (the id and
@@ -231,6 +268,33 @@ On the next start, `PluginHost.lastCrash` reports that plugin. Loading the **sam
 `PluginHostError.crashedBuild`, and the plugin is shown as disabled. Loading a **new build** of
 the same plugin id clears the record. The tests crash a child process on purpose with both a
 null write (`SIGSEGV`) and a Swift trap (`SIGTRAP`) to check this.
+
+## Out-of-process plugins
+
+`load(path, isolation: .process(sandbox: true))` runs the plugin in its own
+`cordis-plugin-helper` process. The plugin binary and its API are unchanged: the helper hands it
+the usual `cordis_host` table, and each entry forwards to the host over a Unix socket
+([CordisWire](Sources/CordisWire/Wire.swift): length-prefixed CordisValue frames).
+
+- **Calls nest both ways.** A host service call waits for the answer while serving the helper's
+  own requests (calls, registrations, emits), and the helper does the same, so
+  host -> plugin -> host -> plugin chains work, including a plugin calling its own service.
+- **Events and timer ticks are sent without waiting**, in order, so a slow plugin doesn't stall
+  the host. The helper still has to answer each within `helperTimeout` (5 s by default).
+- **A crash or a hang only ends the helper.** EOF, a non-zero exit, or a missed timeout kills the
+  helper and goes through the same path as an in-process fault (`HostEvent.crashed`, dependents
+  disposed, `.disabled`).
+- **Sandbox.** With `sandbox: true` the helper enters the "pure computation" sandbox right after
+  `dlopen`: no files, no network, no new processes or IPC. The plugin reaches the world only
+  through host services, and `caller` tells the host which plugin is asking.
+- **Hot reload** keeps the isolation: a new build gets a new helper.
+
+Ship the helper next to the app's executable (or in `Contents/Helpers`), or build your own: it is
+one line, `cordisHelperMain(CommandLine.arguments)` from the `CordisHelper` library.
+
+Cost, measured with `cordis-bench remote` (below): about 9 µs per call against about 0.1 µs in
+process, 2.5 ms to start a helper and apply its plugin, and 1.2 to 1.9 MB of physical footprint
+per helper. Use it for plugins you don't trust, not for hot paths.
 
 ## The ABI (v1)
 
@@ -254,7 +318,33 @@ Plugins can be written in C as well.
 
 ## Benchmarks
 
-Machine: Apple M3, macOS 26.5, host built with Swift 6.3.2 (`-c release`), plugin built by
+### Crash recovery guard and out-of-process calls
+
+Same Counter plugin, release builds, an M-series Mac that was busy with other builds
+(load average 9 to 22), three runs each. `old` is v0.1.2 (no guard), `new` is this version:
+
+```sh
+cordis-bench bench  libcounter.dylib 1000000 100                          # in-process
+cordis-bench remote libcounter.dylib .build/release/cordis-plugin-helper 20000 10
+```
+
+| Measurement | v0.1.2 | this version |
+|---|---|---|
+| host -> plugin call, `counter.get()` | 135.9 / 167.0 / 144.5 ns | 86.7 / 100.0 / 91.7 ns |
+| host -> plugin call, `counter.echo({url, tab, flags})` | 742.8 / 850.3 / 721.8 ns | 723.1 / 749.3 / 792.9 ns |
+| host -> helper call, `counter.get()` (sandboxed helper) | – | 9.08 / 9.07 / 9.30 µs |
+| host -> helper call, `counter.echo({url, tab, flags})` | – | 10.60 / 9.12 / 9.87 µs |
+| host -> helper call, `echo` of a 35,785-byte array | – | 240.4 / 239.6 / 242.8 µs |
+| start helper + manifest + apply + unload | – | 2.81 / 2.51 / 2.53 ms |
+| helper `phys_footprint`, 1 plugin, sandboxed | – | 1,802,600 / 1,900,904 / 1,900,904 B |
+| 10 helpers, mean footprint each | – | 1,209,480 / 1,202,921 / 1,211,113 B |
+
+The guarded call is not slower than v0.1.2's call: the guard replaced two Swift calls that swapped
+the crash tag around every call.
+
+### v0.1 baseline
+
+Measured for v0.1. Machine: Apple M3, macOS 26.5, host built with Swift 6.3.2 (`-c release`), plugin built by
 `cordis-build` with the swift.org 6.3.2 toolchain. The command, which builds the Counter example
 and runs 1,000,000 calls and 100 load/unload cycles:
 
@@ -293,8 +383,9 @@ retention better than a per-plugin leak. It is not fully explained yet.
 - **Main thread only.** A plugin that calls the host from another thread traps.
 - **Global state in plugins** needs `nonisolated(unsafe)`. Reset it in `dispose`, because a
   plugin can be applied again without being reloaded.
-- **Not a sandbox.** Plugins run in-process with full privileges. Crash attribution tells you
-  which plugin crashed, but it cannot prevent the crash.
+- **In-process plugins are not sandboxed.** They run with the app's privileges, and a plugin that
+  corrupts the heap (or faults inside `malloc`) still takes the process down; recovery covers
+  faults in the plugin's own code. Run untrusted plugins with `.process(sandbox: true)`.
 - One provider per service name. A second `provide` of the same name returns handle 0 and logs
   an error.
 - Only arm64 dylibs are built by default.
@@ -320,7 +411,10 @@ Sources/CCordis/include/cordis.h   the plugin ABI (C)
 Sources/CordisValue/               Value + binary codec, Foundation-free, shared with plugins
 Sources/CordisKit/                 Embedded Swift plugin SDK
 Sources/Cordis/                    host runtime (PluginHost)
-Sources/CCordisHost/               async-signal-safe crash attribution (C)
+Sources/CCordisHost/               async-signal-safe crash attribution and recovery guards (C)
+Sources/CordisWire/                framed messages between a host and a plugin helper
+Sources/CordisHelper/              the helper's runtime (cordisHelperMain); CCordisHelper: sandbox
+Sources/cordis-plugin-helper/      the helper executable
 Sources/cordis-bench/              benchmark + crash helper
 Scripts/cordis-build               plugin build script
 Examples/Counter, Examples/Greeter provider + consumer

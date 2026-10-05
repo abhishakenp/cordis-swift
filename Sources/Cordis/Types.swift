@@ -32,6 +32,10 @@ public struct PluginInfo: Equatable, Sendable {
   /// First 16 hex digits of the SHA-256 of the dylib.
   public let buildHash: String
   public let state: PluginState
+  /// Where it runs (`.process` for plugins in a helper process).
+  public var isolation: PluginIsolation = .inProcess
+  /// The helper's pid for an out-of-process plugin that is running.
+  public var helperPID: Int32? = nil
 }
 
 /// What happened when a plugin image was closed.
@@ -65,6 +69,8 @@ public enum PluginHostError: Error, Equatable, CustomStringConvertible {
   case notLoaded(id: String)
   /// The plugin's code faulted while the host read its manifest; the host recovered.
   case crashedWhileLoading(path: String, signal: Int32)
+  /// The helper process for an out-of-process plugin could not be started or did not answer.
+  case helperFailed(String)
 
   public var description: String {
     switch self {
@@ -77,6 +83,7 @@ public enum PluginHostError: Error, Equatable, CustomStringConvertible {
     case let .crashedBuild(id, hash): "plugin '\(id)' build \(hash) crashed the host last time; waiting for a new build"
     case let .notLoaded(id): "no plugin with id '\(id)'"
     case let .crashedWhileLoading(path, signal): "plugin \(path) crashed while loading (\(signalName(signal)))"
+    case let .helperFailed(reason): "plugin helper: \(reason)"
     }
   }
 }

@@ -23,6 +23,10 @@ final class PluginRecord {
   let cachePath: String?
 
   var dl: UnsafeMutableRawPointer?
+  /// Out-of-process plugins: the helper process serving this record (`dl` stays nil).
+  var remote: RemotePlugin?
+  /// The image is open in this process, or the helper is running.
+  var isLoaded: Bool { dl != nil || remote != nil }
   let applyFn: cordis_plugin_apply_fn?
   let disposeFn: cordis_plugin_dispose_fn?
   /// Any code address inside the image, used to double-check that it was unmapped.
@@ -36,6 +40,7 @@ final class PluginRecord {
   var crash: Int32?
   /// How many calls into this plugin are on the stack right now.
   var frames = 0
+  var isolation: PluginIsolation = .inProcess
 
   /// "<id>\t<buildHash>", read by the crash handler while this plugin's code runs.
   let tag: UnsafeMutablePointer<CChar>

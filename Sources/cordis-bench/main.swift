@@ -1,6 +1,7 @@
 // cordis-bench: micro-benchmarks for the plugin host, plus a crash helper used by the tests.
 //
 //   cordis-bench bench <libcounter.dylib> [calls=1000000] [cycles=100]
+//   cordis-bench remote <libcounter.dylib> <cordis-plugin-helper> [calls=20000] [helpers=10]
 //   cordis-bench crash <plugin.dylib> <marker-path> <service> <method> [recover]
 import Cordis
 import Darwin
@@ -86,6 +87,81 @@ func bench(_ path: String, calls: Int, cycles: Int) {
   if sink == 42 { print("") }  // keep `sink` alive
 }
 
+/// Out-of-process plugin costs: spawn + apply, call latency, helper footprint.
+@MainActor
+func benchRemote(_ path: String, helper: String, calls: Int, helpers: Int) {
+  let host = PluginHost(crashMarkerPath: nil)
+  host.onEvent = { _ in }
+  host.helperExecutable = helper
+  // Warm: the first dlopen of a new file is checked by macOS.
+  do { try host.load(path, isolation: .process(sandbox: true)) } catch { fail("load failed: \(error)") }
+  _ = try? host.unload("counter")
+
+  var t0 = now()
+  let spawns = 20
+  for _ in 0..<spawns {
+    do { try host.load(path, isolation: .process(sandbox: true)) } catch { fail("load failed: \(error)") }
+    _ = try? host.unload("counter")
+  }
+  let spawnMs = Double(now() - t0) / Double(spawns) / 1_000_000
+
+  do { try host.load(path, isolation: .process(sandbox: true)) } catch { fail("load failed: \(error)") }
+  guard host.plugin("counter")?.state == .active else { fail("counter plugin is not active") }
+  for _ in 0..<1000 { _ = host.call("counter", "get") }
+  t0 = now()
+  var sink: Int64 = 0
+  for _ in 0..<calls { sink &+= host.call("counter", "get").int ?? 0 }
+  let getUs = Double(now() - t0) / Double(calls) / 1000
+  t0 = now()
+  for i in 0..<calls { sink &+= host.call("counter", "echo", .int(Int64(i))).int ?? 0 }
+  let echoUs = Double(now() - t0) / Double(calls) / 1000
+  let payload: Value = ["url": "https://example.com/some/page", "tab": 42, "flags": [true, false]]
+  t0 = now()
+  for _ in 0..<calls { if case .object = host.call("counter", "echo", payload) { sink &+= 1 } }
+  let objUs = Double(now() - t0) / Double(calls) / 1000
+  let big: Value = .array((0..<1000).map { .string("row \($0) https://example.com/\($0)") })
+  t0 = now()
+  let bigCalls = max(1, calls / 20)
+  for _ in 0..<bigCalls { if case .array = host.call("counter", "echo", big) { sink &+= 1 } }
+  let bigUs = Double(now() - t0) / Double(bigCalls) / 1000
+  let bigBytes = Codec.encodedSize(big)
+  let oneFootprint = host.helperFootprint("counter") ?? 0
+  _ = try? host.unload("counter")
+
+  // N helpers at once: host + helpers footprint.
+  let hostBefore = footprint()
+  var total: UInt64 = 0
+  var ids: [String] = []
+  for i in 0..<helpers {
+    // Same plugin under N files would collide on its id: load it N times by unloading in between is
+    // not "at once", so measure one helper N times as separate processes via distinct hosts.
+    let h = PluginHost(crashMarkerPath: nil)
+    h.onEvent = { _ in }
+    h.helperExecutable = helper
+    do { try h.load(path, isolation: .process(sandbox: true)) } catch { fail("load failed: \(error)") }
+    _ = h.call("counter", "increment", .int(Int64(i)))
+    total += h.helperFootprint("counter") ?? 0
+    hosts.append(h)
+    ids.append("counter")
+  }
+  let hostAfter = footprint()
+  hosts.removeAll()
+
+  func f(_ x: Double) -> String { String(format: "%.1f", x) }
+  func f2(_ x: Double) -> String { String(format: "%.2f", x) }
+  print("helper spawn + manifest + apply + unload      : \(f2(spawnMs)) ms/cycle (\(spawns) cycles)")
+  print("host -> helper call, counter.get()            : \(f2(getUs)) us/op  (\(calls) calls)")
+  print("host -> helper call, counter.echo(int)        : \(f2(echoUs)) us/op")
+  print("host -> helper call, counter.echo(3-key obj)  : \(f2(objUs)) us/op")
+  print("host -> helper call, echo(\(bigBytes) B array) : \(f(bigUs)) us/op  (\(bigCalls) calls)")
+  print("helper phys_footprint (1 plugin, sandboxed)   : \(oneFootprint) bytes")
+  print("\(helpers) helpers: sum of helper footprints     : \(total) bytes (\(total / UInt64(max(helpers, 1))) per helper)")
+  print("host phys_footprint before/after \(helpers) helpers : \(hostBefore) -> \(hostAfter) bytes")
+  if sink == 42 { print("") }
+}
+
+nonisolated(unsafe) var hosts: [PluginHost] = []
+
 @MainActor
 func crash(_ path: String, marker: String, service: String, method: String, recover: Bool) {
   PluginHost.crashRecovery = recover
@@ -104,6 +180,11 @@ case "bench":
   let calls = args.count > 3 ? Int(args[3]) ?? 1_000_000 : 1_000_000
   let cycles = args.count > 4 ? Int(args[4]) ?? 100 : 100
   MainActor.assumeIsolated { bench(args[2], calls: calls, cycles: cycles) }
+case "remote":
+  guard args.count >= 4 else { fail("usage: cordis-bench remote <libcounter.dylib> <cordis-plugin-helper> [calls] [helpers]") }
+  let calls = args.count > 4 ? Int(args[4]) ?? 20000 : 20000
+  let helpers = args.count > 5 ? Int(args[5]) ?? 10 : 10
+  MainActor.assumeIsolated { benchRemote(args[2], helper: args[3], calls: calls, helpers: helpers) }
 case "crash":
   guard args.count >= 6 else { fail("usage: cordis-bench crash <dylib> <marker> <service> <method> [recover]") }
   MainActor.assumeIsolated {

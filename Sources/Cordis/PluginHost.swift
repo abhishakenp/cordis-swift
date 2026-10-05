@@ -13,11 +13,14 @@ public final class PluginHost {
   enum ListenerTarget {
     case host((Value) -> Void)
     case plugin(cordis_event_fn, UnsafeMutableRawPointer?)
+    /// A callback in an out-of-process plugin, by its helper-side token.
+    case remote(RemotePlugin, Int64)
   }
 
   enum ServiceTarget {
     case host((String, Value) -> Value)
     case plugin(cordis_service_fn, UnsafeMutableRawPointer?)
+    case remote(RemotePlugin, Int64)
   }
 
   struct Listener {
@@ -88,6 +91,24 @@ public final class PluginHost {
     set { cordis_guard_set_enabled(newValue) }
   }
   private var watchers: [String: FileWatcher] = [:]
+  /// How each path was loaded last (reloads and watches keep it).
+  private var isolationByPath: [String: PluginIsolation] = [:]
+
+  /// The executable that hosts out-of-process plugins (`PluginIsolation.process`). Defaults to
+  /// `cordis-plugin-helper` next to the main executable, else in `Contents/Helpers` of the app.
+  public var helperExecutable: String = PluginHost.defaultHelperExecutable
+
+  public static var defaultHelperExecutable: String {
+    let exe = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+    let dir = exe.deletingLastPathComponent()
+    let sibling = dir.appendingPathComponent("cordis-plugin-helper").path
+    if FileManager.default.isExecutableFile(atPath: sibling) { return sibling }
+    return dir.deletingLastPathComponent().appendingPathComponent("Helpers/cordis-plugin-helper").path
+  }
+
+  /// Seconds an out-of-process plugin may take to answer (a call, an event, a timer tick) before
+  /// its helper is killed as hung and the plugin is reported as crashed.
+  public var helperTimeout: Double = 5
 
   public static var defaultCacheDirectory: String {
     let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
@@ -96,7 +117,7 @@ public final class PluginHost {
 
   /// Deletes cached dylib copies that are not currently loaded.
   public func pruneCache() {
-    let live = Set(records.values.compactMap { $0.dl != nil ? $0.cachePath : nil })
+    let live = Set(records.values.compactMap { $0.isLoaded ? $0.cachePath : nil })
     let files = (try? FileManager.default.contentsOfDirectory(atPath: cacheDirectory)) ?? []
     for f in files where f.hasSuffix(".dylib") {
       let p = (cacheDirectory as NSString).appendingPathComponent(f)
@@ -189,6 +210,16 @@ public final class PluginHost {
       callDepth -= 1
       if !reuse { buf.deallocate() }
       return ok ? CBytes.take(result) : Self.crashedError(owner)
+    case let .remote(rp, token):
+      guard let owner = s.owner else { return Self.error("service '\(service)' has no owner") }
+      if owner.crash != nil { return Self.crashedError(owner) }
+      var out: Value?
+      guarded(owner) { _, _ in
+        out = rp.request(.service, [.int(token), .string(method), .bytes(Codec.encode(args))])
+        return out == nil ? rp.failure : 0
+      }
+      guard let out else { return Self.crashedError(owner) }
+      return Codec.decode(out.bytesOrEmpty) ?? .null
     }
   }
 
@@ -214,6 +245,10 @@ public final class PluginHost {
         if encoded == nil { encoded = Codec.encode(payload) }
         let bytes = encoded!
         guarded(owner) { tag, image in CBytes.borrow(bytes) { cordis_guard_event(fn, ud, $0, tag, image) } }
+      case let .remote(rp, token):
+        guard let owner = l.owner, owner.crash == nil else { continue }
+        if encoded == nil { encoded = Codec.encode(payload) }
+        rp.post(.event, [.int(token), .bytes(encoded!)])
       }
     }
   }
@@ -236,15 +271,19 @@ public final class PluginHost {
   // MARK: - Loading
 
   /// Loads a plugin dylib. It is applied as soon as every injected service exists.
+  /// - Parameter isolation: where the plugin runs; nil keeps what this path was loaded with before
+  ///   (`.inProcess` the first time).
   @discardableResult
-  public func load(_ path: String) throws(PluginHostError) -> PluginInfo {
+  public func load(_ path: String, isolation: PluginIsolation? = nil) throws(PluginHostError) -> PluginInfo {
+    let isolation = isolation ?? isolationByPath[path] ?? .inProcess
+    isolationByPath[path] = isolation
     let data: Data
     do { data = try Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped) } catch {
       throw .unreadable(path: path, reason: error.localizedDescription)
     }
     let hash = Self.hash(data)
     if let crash = lastCrash, crash.buildHash == hash {
-      if records[crash.pluginID] == nil || records[crash.pluginID]?.dl == nil {
+      if records[crash.pluginID] == nil || records[crash.pluginID]?.isLoaded == false {
         setDisabled(id: crash.pluginID, path: path, hash: hash, reason: PluginHostError.crashedBuild(id: crash.pluginID, buildHash: hash).description)
       }
       throw .crashedBuild(id: crash.pluginID, buildHash: hash)
@@ -257,6 +296,10 @@ public final class PluginHost {
       do { try data.write(to: URL(fileURLWithPath: copy), options: .atomic) } catch {
         throw .unreadable(path: copy, reason: error.localizedDescription)
       }
+    }
+
+    if case let .process(sandbox) = isolation {
+      return try loadRemote(path: path, copy: copy, hash: hash, sandbox: sandbox)
     }
 
     guard let dl = dlopen(copy, RTLD_NOW | RTLD_LOCAL) else {
@@ -338,7 +381,7 @@ public final class PluginHost {
     }
     let hash = Self.hash(data)
     let current = records.values.first { $0.path == path }
-    if let current, current.buildHash == hash, current.dl != nil { return .unchanged }
+    if let current, current.buildHash == hash, current.isLoaded { return .unchanged }
 
     var previous: UnloadReport?
     if let current {
@@ -363,7 +406,8 @@ public final class PluginHost {
   // MARK: - Hot reload
 
   /// Loads `path` (if not loaded yet) and reloads it whenever the file changes on disk.
-  public func watch(_ path: String) {
+  public func watch(_ path: String, isolation: PluginIsolation? = nil) {
+    if let isolation { isolationByPath[path] = isolation }
     guard watchers[path] == nil else { return }
     if !records.values.contains(where: { $0.path == path }) {
       do { try load(path) } catch { emitHostEvent(.reloadFailed(path: path, reason: error.description)) }
@@ -391,6 +435,68 @@ public final class PluginHost {
     return CrashRecord(pluginID: parts[0], buildHash: parts[1], signal: sig)
   }
 
+  // MARK: - Internals: out-of-process plugins
+
+  private func loadRemote(path: String, copy: String, hash: String, sandbox: Bool) throws(PluginHostError) -> PluginInfo {
+    let (rp, manifest) = try RemotePlugin.spawn(helper: helperExecutable, dylib: copy, sandbox: sandbox, host: self)
+    guard let id = manifest["id"].string, !id.isEmpty else {
+      rp.terminate()
+      throw .badManifest("missing id")
+    }
+    if let abi = manifest["abi"].int, abi != Int64(CORDIS_ABI_VERSION) {
+      rp.terminate()
+      throw .abiMismatch(abi)
+    }
+    if let existing = records[id], existing.isLoaded {
+      rp.terminate()
+      throw .duplicate(id: id)
+    }
+    if let crash = lastCrash, crash.pluginID == id { clearCrashRecord() }
+    let record = PluginRecord(
+      host: self, id: id, name: manifest["name"].string ?? id, version: manifest["version"].string ?? "0.0.0",
+      inject: manifest["inject"].array?.compactMap(\.string) ?? [],
+      provides: manifest["provides"].array?.compactMap(\.string) ?? [],
+      path: path, buildHash: hash, imagePath: "helper:\(rp.pid)", cachePath: copy, dl: nil,
+      applyFn: nil, disposeFn: nil, probeAddress: nil)
+    record.remote = rp
+    record.isolation = .process(sandbox: sandbox)
+    rp.record = record
+    if !order.contains(id) { order.append(id) }
+    records[id] = record
+    reconcile()
+    return info(records[id] ?? record)
+  }
+
+  /// A call from an out-of-process plugin: the same routing as an in-process plugin's call.
+  func remoteCall(from r: PluginRecord, service: String, method: String, args: [UInt8]) -> [UInt8] {
+    var m = method
+    let result = m.withUTF8 { mb in
+      args.withUnsafeBufferPointer { ab in
+        rawCall(
+          from: r, service: service, method: cordis_bytes(data: mb.baseAddress, len: mb.count),
+          args: cordis_bytes(data: ab.baseAddress, len: ab.count))
+      }
+    }
+    defer { if let d = result.data { free(UnsafeMutableRawPointer(mutating: d)) } }
+    return result.data.map { Array(UnsafeBufferPointer(start: $0, count: result.len)) } ?? []
+  }
+
+  func remoteEmit(from r: PluginRecord, event: String, payload: [UInt8]) {
+    payload.withUnsafeBufferPointer { rawEmit(from: r, event: event, payload: cordis_bytes(data: $0.baseAddress, len: $0.count)) }
+  }
+
+  /// The helper of `rp` died or was killed as hung: handled exactly like an in-process fault.
+  func remoteDied(_ rp: RemotePlugin, signal: Int32, reason: String?) {
+    guard let r = rp.record, r.crash == nil else { return }
+    r.crash = signal == 0 ? SIGKILL : signal
+    pendingCrashes.append(r)
+    emitHostEvent(.log(pluginID: r.id, level: .error, message: "helper \(reason ?? "exited") (\(signalName(r.crash ?? 0))); unloading it"))
+    if pluginFrames == 0 { finishCrashes() }
+  }
+
+  /// The helper's physical footprint for an out-of-process plugin (bytes; nil when in-process or gone).
+  public func helperFootprint(_ id: String) -> UInt64? { records[id]?.remote.map(\.footprint) }
+
   // MARK: - Internals: crash recovery
 
   /// One call into plugin code through a `cordis_guard_*` function. Returns false when the plugin
@@ -416,7 +522,7 @@ public final class PluginHost {
   private func finishCrashes() {
     while !pendingCrashes.isEmpty {
       let r = pendingCrashes.removeFirst()
-      guard records[r.id] === r, r.dl != nil else { continue }
+      guard records[r.id] === r, r.isLoaded else { continue }
       let outer = reconciling
       reconciling = true
       // Dependents are disposed normally (their dispose runs); the crashed plugin's isn't called.
@@ -465,7 +571,10 @@ public final class PluginHost {
   }
 
   private func info(_ r: PluginRecord) -> PluginInfo {
-    r.info(missing: r.inject.filter { services[$0] == nil })
+    var i = r.info(missing: r.inject.filter { services[$0] == nil })
+    i.isolation = r.isolation
+    i.helperPID = r.remote?.pid
+    return i
   }
 
   private func setDisabled(id: String, path: String, hash: String, reason: String) {
@@ -528,6 +637,9 @@ public final class PluginHost {
     case let .plugin(fn, ud):
       guard let owner = reg.owner, owner.crash == nil else { return }
       guarded(owner) { tag, image in cordis_guard_event(fn, ud, cordis_bytes(data: nil, len: 0), tag, image) }
+    case let .remote(rp, token):
+      guard let owner = reg.owner, owner.crash == nil else { return }
+      rp.post(.timer, [.int(token)])
     }
     if !repeats { removeRegistration(h) }
   }
@@ -544,6 +656,17 @@ public final class PluginHost {
       var result = cordis_bytes(data: nil, len: 0)
       let ok = guarded(owner) { tag, image in cordis_guard_service(fn, ud, method, args, tag, image, &result) }
       return ok ? result : CBytes.owned(Self.crashedError(owner))
+    case let .remote(rp, token):
+      guard let owner = s.owner else { return CBytes.owned(Self.error("service '\(service)' has no owner")) }
+      if owner.crash != nil { return CBytes.owned(Self.crashedError(owner)) }
+      let argBytes: [UInt8] = args.data.map { Array(UnsafeBufferPointer(start: $0, count: args.len)) } ?? []
+      var out: Value?
+      guarded(owner) { _, _ in
+        out = rp.request(.service, [.int(token), .string(CBytes.string(method)), .bytes(argBytes)])
+        return out == nil ? rp.failure : 0
+      }
+      guard let out else { return CBytes.owned(Self.crashedError(owner)) }
+      return CBytes.owned(out.bytesOrEmpty)
     case let .host(fn):
       let m = CBytes.string(method), a = CBytes.value(args)
       return CBytes.owned(asCaller(r.id) { enter(nil) { fn(m, a) } })
@@ -567,6 +690,10 @@ public final class PluginHost {
       case let .plugin(fn, ud):
         guard let owner = l.owner, owner.crash == nil else { continue }
         guarded(owner) { tag, image in cordis_guard_event(fn, ud, payload, tag, image) }
+      case let .remote(rp, token):
+        guard let owner = l.owner, owner.crash == nil else { continue }
+        let bytes: [UInt8] = payload.data.map { Array(UnsafeBufferPointer(start: $0, count: payload.len)) } ?? []
+        rp.post(.event, [.int(token), .bytes(bytes)])
       case let .host(fn):
         if decoded == nil { decoded = CBytes.value(payload) }
         let v = decoded!
@@ -617,7 +744,7 @@ public final class PluginHost {
     repeat {
       dirty = false
       for id in order {
-        guard let r = records[id], r.phase == .pending, r.dl != nil,
+        guard let r = records[id], r.phase == .pending, r.isLoaded,
           r.inject.allSatisfy({ services[$0] != nil })
         else { continue }
         apply(r)
@@ -626,11 +753,20 @@ public final class PluginHost {
   }
 
   private func apply(_ r: PluginRecord) {
-    guard let applyFn = r.applyFn else { return }
-    r.phase = .active
     var rc: Int32 = -1
-    let table = UnsafePointer(r.table)
-    guarded(r) { tag, image in cordis_guard_apply(applyFn, table, tag, image, &rc) }
+    if let rp = r.remote {
+      r.phase = .active
+      guarded(r) { _, _ in
+        guard let v = rp.request(.apply, []) else { return rp.failure }
+        rc = Int32(truncatingIfNeeded: v.int ?? -1)
+        return 0
+      }
+    } else {
+      guard let applyFn = r.applyFn else { return }
+      r.phase = .active
+      let table = UnsafePointer(r.table)
+      guarded(r) { tag, image in cordis_guard_apply(applyFn, table, tag, image, &rc) }
+    }
     if r.crash != nil { return }  // torn down as a crash (now, or once the stack unwinds)
     if rc == 0 {
       emitHostEvent(.applied(id: r.id))
@@ -664,7 +800,9 @@ public final class PluginHost {
       }
     }
     // A plugin that faulted is never called again, not even to dispose.
-    if let disposeFn = r.disposeFn, r.crash == nil {
+    if let rp = r.remote, r.crash == nil {
+      guarded(r) { _, _ in rp.request(.dispose, []) == nil ? rp.failure : 0 }
+    } else if let disposeFn = r.disposeFn, r.crash == nil {
       guarded(r) { tag, image in cordis_guard_dispose(disposeFn, tag, image) }
     }
     for h in r.handles { removeRegistration(h) }
@@ -692,6 +830,13 @@ public final class PluginHost {
   }
 
   private func closeImage(_ r: PluginRecord, cascaded: [String]) -> UnloadReport {
+    if let rp = r.remote {
+      rp.terminate()
+      r.remote = nil
+      let n = Int(_dyld_image_count())
+      return UnloadReport(
+        id: r.id, imagePath: r.imagePath, imageCountBefore: n, imageCountAfter: n, unmapped: !rp.isAlive, cascaded: cascaded)
+    }
     let before = Int(_dyld_image_count())
     if let dl = r.dl {
       dlclose(dl)

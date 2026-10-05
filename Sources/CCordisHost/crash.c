@@ -27,7 +27,7 @@ static atomic_bool g_installed = false;
 // MARK: - Recovery frames
 
 typedef struct guard_frame {
-  sigjmp_buf env;
+  jmp_buf env;
   struct guard_frame *prev;
   cordis_guard_image image;
   pthread_t thread;
@@ -72,22 +72,47 @@ static void fault_registers(void *uctx, uintptr_t *pc, uintptr_t *lr) {
 #endif
 }
 
-/// Jumps back into the innermost guard when this fault is the plugin's own (see the header).
-static void try_recover(int sig, void *uctx) {
-  if (!atomic_load_explicit(&g_enabled, memory_order_relaxed)) return;
+/// Runs in normal context after the signal handler returned: back to the guard that called the plugin.
+__attribute__((noreturn)) static void recover_trampoline(int sig, guard_frame *f) { _longjmp(f->env, sig); }
+
+/// When this fault is the plugin's own (see the header), rewrites the interrupted context so that
+/// returning from the handler lands in `recover_trampoline` on the dead plugin part of the stack.
+/// Returning (sigreturn) lets the kernel restore the signal mask and the alternate-stack state, so
+/// the hot path can use `_setjmp`, which saves no mask (no syscall per call). Returns true when the
+/// context was redirected.
+static bool try_recover(int sig, void *uctx) {
+  if (!atomic_load_explicit(&g_enabled, memory_order_relaxed)) return false;
   guard_frame *f = g_top;
-  if (!f || !pthread_equal(f->thread, pthread_self()) || f->image.hi == 0) return;
+  if (!f || !pthread_equal(f->thread, pthread_self()) || f->image.hi == 0) return false;
   uintptr_t pc, lr;
   fault_registers(uctx, &pc, &lr);
   bool own = in_image(f->image, pc) || (in_image(g_platform, pc) && in_image(f->image, lr));
-  if (!own) return;
+  if (!own) return false;
+  ucontext_t *uc = (ucontext_t *)uctx;
+  // Below the guard's frame: only dead plugin frames live there (and it's mapped, unlike the
+  // guard page a stack overflow hit).
+  uintptr_t sp = ((uintptr_t)f - 512) & ~(uintptr_t)15;
+#if defined(__arm64__)
+  __darwin_arm_thread_state64_set_sp(uc->uc_mcontext->__ss, (void *)sp);
+  __darwin_arm_thread_state64_set_pc_fptr(uc->uc_mcontext->__ss, (void *)recover_trampoline);
+  uc->uc_mcontext->__ss.__x[0] = (uint64_t)sig;
+  uc->uc_mcontext->__ss.__x[1] = (uint64_t)(uintptr_t)f;
+#elif defined(__x86_64__)
+  sp -= 8;  // as if `call` pushed a return address
+  uc->uc_mcontext->__ss.__rsp = sp;
+  uc->uc_mcontext->__ss.__rip = (uint64_t)(uintptr_t)recover_trampoline;
+  uc->uc_mcontext->__ss.__rdi = (uint64_t)sig;
+  uc->uc_mcontext->__ss.__rsi = (uint64_t)(uintptr_t)f;
+#else
+  return false;
+#endif
   g_last_pc = pc;
-  siglongjmp(f->env, sig);
+  return true;
 }
 
 static void on_crash(int sig, siginfo_t *info, void *uctx) {
   (void)info;
-  try_recover(sig, uctx);
+  if (try_recover(sig, uctx)) return;
   const char *tag = atomic_load_explicit(&g_current, memory_order_relaxed);
   // Attribute only a fault on the thread running the plugin (a background thread crashing while
   // a plugin runs on the main thread is not that plugin's fault).
@@ -168,14 +193,14 @@ cordis_guard_image cordis_guard_image_of(const void *address) {
 }
 
 // Each guard: push a frame, set the crash tag, call, pop. Locals read after a jump are set before
-// sigsetjmp and never modified afterwards, so they need no volatile.
+// _setjmp and never modified afterwards, so they need no volatile.
 #define GUARD_BEGIN                                       \
   guard_frame f;                                          \
   f.prev = g_top;                                         \
   f.image = image;                                        \
   f.thread = pthread_self();                              \
   const char *previous_tag = cordis_crash_swap_current(tag); \
-  int sig = sigsetjmp(f.env, 1);                          \
+  int sig = _setjmp(f.env);                               \
   if (sig == 0) {                                         \
     g_top = &f;
 
