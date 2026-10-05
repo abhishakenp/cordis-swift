@@ -103,6 +103,14 @@ public enum HostEvent: Sendable {
   case crashed(CrashReport)
 }
 
+/// Something a plugin asks the host to do on its behalf (see `PluginHost.authorize`).
+public enum PluginAccess: Equatable, Sendable {
+  case call(service: String, method: String)
+  case listen(event: String)
+  case emit(event: String)
+  case provide(service: String)
+}
+
 /// A plugin fault the host recovered from (see `PluginHost.crashRecovery`).
 public struct CrashReport: Equatable, Sendable {
   public let id: String
