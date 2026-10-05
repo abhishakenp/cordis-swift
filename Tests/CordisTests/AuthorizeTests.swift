@@ -41,6 +41,25 @@ struct AuthorizeTests {
     host.unloadAll()
   }
 
+  @Test(arguments: [PluginIsolation.inProcess, .process(sandbox: true)])
+  func deliverFiltersEventsPerListener(_ isolation: PluginIsolation) async throws {
+    let (host, _) = makeRemoteHost()
+    // greeter answers greeter/ping with greeter/pong; it only gets pings addressed to it.
+    host.deliver = { listener, event, payload in
+      event != "greeter/ping" || payload()["to"].string == listener
+    }
+    try host.load(Fixtures.path("counter"))
+    try host.load(Fixtures.path("greeter"), isolation: isolation)
+    var pongs: [Value] = []
+    host.on("greeter/pong") { pongs.append($0) }
+    host.emit("greeter/ping", ["to": "someone else"])
+    host.emit("greeter/ping", ["to": "greeter", "n": 2])
+    #expect(await eventually { pongs.count == 1 })
+    try? await Task.sleep(for: .milliseconds(200))  // a wrongly delivered ping would answer by now
+    #expect(pongs == [["to": "greeter", "n": 2]])
+    host.unloadAll()
+  }
+
   @Test func refusedListenAndProvide() throws {
     let (host, log) = makeHost()
     host.authorize = { _, access in

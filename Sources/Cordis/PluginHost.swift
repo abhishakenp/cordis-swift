@@ -89,6 +89,11 @@ public final class PluginHost {
   /// emit is dropped. nil (the default) allows everything. The host's own calls are never asked.
   public var authorize: ((_ plugin: String, _ access: PluginAccess) -> Bool)?
 
+  /// Asked before an event reaches a plugin's listener; false skips that listener. `payload` decodes
+  /// the event lazily (only when the closure asks for it). Use it to give each plugin only its own
+  /// async results when results travel as broadcast events. nil (the default) delivers everything.
+  public var deliver: ((_ listener: String, _ event: String, _ payload: () -> Value) -> Bool)?
+
   /// Recover from faults in plugin code (process-wide; see `cordis_guard_*` in CCordisHost):
   /// a plugin that traps or segfaults is fenced off and unloaded and the call returns an error,
   /// instead of the whole process crashing. On by default.
@@ -248,11 +253,13 @@ public final class PluginHost {
       case let .host(fn): enter(nil) { fn(payload) }
       case let .plugin(fn, ud):
         guard let owner = l.owner, owner.crash == nil else { continue }
+        if let deliver, !deliver(owner.id, event, { payload }) { continue }
         if encoded == nil { encoded = Codec.encode(payload) }
         let bytes = encoded!
         guarded(owner) { tag, image in CBytes.borrow(bytes) { cordis_guard_event(fn, ud, $0, tag, image) } }
       case let .remote(rp, token):
         guard let owner = l.owner, owner.crash == nil else { continue }
+        if let deliver, !deliver(owner.id, event, { payload }) { continue }
         if encoded == nil { encoded = Codec.encode(payload) }
         rp.post(.event, [.int(token), .bytes(encoded!)])
       }
@@ -710,9 +717,11 @@ public final class PluginHost {
       switch l.target {
       case let .plugin(fn, ud):
         guard let owner = l.owner, owner.crash == nil else { continue }
+        if let deliver, !deliver(owner.id, event, { decoded ?? CBytes.value(payload) }) { continue }
         guarded(owner) { tag, image in cordis_guard_event(fn, ud, payload, tag, image) }
       case let .remote(rp, token):
         guard let owner = l.owner, owner.crash == nil else { continue }
+        if let deliver, !deliver(owner.id, event, { decoded ?? CBytes.value(payload) }) { continue }
         let bytes: [UInt8] = payload.data.map { Array(UnsafeBufferPointer(start: $0, count: payload.len)) } ?? []
         rp.post(.event, [.int(token), .bytes(bytes)])
       case let .host(fn):
