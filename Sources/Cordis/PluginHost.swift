@@ -281,6 +281,10 @@ public final class PluginHost {
 
   public func plugin(_ id: String) -> PluginInfo? { records[id].map(info) }
 
+  /// Where plugin `id` runs (nil when there is no such plugin). One dictionary lookup, so a host can
+  /// call it per access (e.g. trust in-process plugins and gate helper-hosted ones in `authorize`).
+  public func isolation(of id: String) -> PluginIsolation? { records[id]?.isolation }
+
   // MARK: - Loading
 
   /// Loads a plugin dylib. It is applied as soon as every injected service exists.
