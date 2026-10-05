@@ -6,6 +6,8 @@
 //
 //   cordis-plugin-helper <plugin.dylib> [--sandbox]
 //
+// fd 3: the socket to the host. fd 4 (optional): the read end of the host's lifeline pipe.
+//
 // With --sandbox the process enters the pure-computation sandbox right after loading the dylib:
 // the plugin can't open files, sockets or other processes; it reaches the world only through the
 // host's services, which the host gates per plugin.
@@ -156,10 +158,31 @@ private func makeTable() -> cordis_host {
   )
 }
 
+/// Ends the helper as soon as the host is gone, even while plugin code is busy (a plugin stuck in
+/// a loop never reads the socket again). fd 4 is the read end of a pipe whose only write end the
+/// host holds and never writes to: a second thread blocks in read() (no wakeups) until the host's
+/// end closes, which happens however the host ends.
+private func exitWhenTheHostIsGone(_ lifeline: Int32) {
+  var thread: pthread_t?
+  let arg = UnsafeMutableRawPointer(bitPattern: Int(lifeline) + 1)!
+  pthread_create(
+    &thread, nil,
+    { raw in
+      let fd = Int32(Int(bitPattern: raw) - 1)
+      var byte: UInt8 = 0
+      while true {
+        let r = read(fd, &byte, 1)
+        if r < 0 && errno == EINTR { continue }
+        if r <= 0 { _exit(0) }  // EOF: the host is gone (or the lifeline is broken)
+      }
+    }, arg)
+}
+
 /// Entry point of cordis-plugin-helper. Never returns.
 public func cordisHelperMain(_ arguments: [String]) -> Never {
   signal(SIGPIPE, SIG_IGN)
   HelperState.wire = WireConnection(fd: 3)
+  if fcntl(4, F_GETFD) != -1 { exitWhenTheHostIsGone(4) }
   guard arguments.count >= 2 else { fail("usage: cordis-plugin-helper <plugin.dylib> [--sandbox]") }
   let path = arguments[1]
   guard let dl = dlopen(path, RTLD_NOW | RTLD_LOCAL) else {

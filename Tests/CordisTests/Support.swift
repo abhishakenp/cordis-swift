@@ -95,8 +95,11 @@ extension Fixtures {
 }
 
 @MainActor
-func makeHost(crashMarker: String? = nil) -> (PluginHost, EventLog) {
-  let host = PluginHost(crashMarkerPath: crashMarker, cacheDirectory: Fixtures.cacheDir)
+/// Each test file gets its own image cache: suites in different files run in parallel, and two
+/// hosts in one process that load the same file share one dyld image (and its globals).
+func makeHost(crashMarker: String? = nil, file: String = #fileID) -> (PluginHost, EventLog) {
+  let tag = file.split(separator: "/").last.map { $0.replacingOccurrences(of: ".swift", with: "") } ?? "x"
+  let host = PluginHost(crashMarkerPath: crashMarker, cacheDirectory: Fixtures.cacheDir + "-" + tag)
   let log = EventLog()
   host.onEvent = { log.events.append($0) }
   return (host, log)

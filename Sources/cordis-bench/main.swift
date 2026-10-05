@@ -185,6 +185,19 @@ case "remote":
   let calls = args.count > 4 ? Int(args[4]) ?? 20000 : 20000
   let helpers = args.count > 5 ? Int(args[5]) ?? 10 : 10
   MainActor.assumeIsolated { benchRemote(args[2], helper: args[3], calls: calls, helpers: helpers) }
+case "orphan":
+  // Leaves a helper whose plugin spins (an event handler that never returns), then exits.
+  guard args.count >= 4 else { fail("usage: cordis-bench orphan <crasher.dylib> <cordis-plugin-helper>") }
+  MainActor.assumeIsolated {
+    let host = PluginHost(crashMarkerPath: nil)
+    host.onEvent = { _ in }
+    host.helperExecutable = args[3]
+    do { try host.load(args[2], isolation: .process(sandbox: true)) } catch { fail("load failed: \(error)") }
+    host.emit("crasher/boom", "spin")
+    print("helper \(host.plugin("crasher")?.helperPID ?? 0)")
+    fflush(stdout)
+    exit(0)
+  }
 case "crash":
   guard args.count >= 6 else { fail("usage: cordis-bench crash <dylib> <marker> <service> <method> [recover]") }
   MainActor.assumeIsolated {

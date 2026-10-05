@@ -87,7 +87,8 @@ public final class PluginHost {
   /// provides a service. Return false to refuse: a refused call returns
   /// `{"error": "permission denied: ..."}`, a refused listen or provide returns handle 0, a refused
   /// emit is dropped. nil (the default) allows everything. The host's own calls are never asked.
-  public var authorize: ((_ plugin: String, _ access: PluginAccess) -> Bool)?
+  /// `args` decodes lazily: a call's arguments, an emit's payload, `.null` for listen and provide.
+  public var authorize: ((_ plugin: String, _ access: PluginAccess, _ args: () -> Value) -> Bool)?
 
   /// Asked before an event reaches a plugin's listener; false skips that listener. `payload` decodes
   /// the event lazily (only when the closure asks for it). Use it to give each plugin only its own
@@ -615,7 +616,7 @@ public final class PluginHost {
   }
 
   func addListener(owner: PluginRecord?, event: String, target: ListenerTarget) -> CordisHandle {
-    if let owner, let authorize, !authorize(owner.id, .listen(event: event)) {
+    if let owner, let authorize, !authorize(owner.id, .listen(event: event), { .null }) {
       emitHostEvent(.log(pluginID: owner.id, level: .warn, message: "permission denied: may not listen to \(event)"))
       return 0
     }
@@ -627,7 +628,7 @@ public final class PluginHost {
   }
 
   func addService(owner: PluginRecord?, name: String, target: ServiceTarget) -> CordisHandle {
-    if let owner, let authorize, !authorize(owner.id, .provide(service: name)) {
+    if let owner, let authorize, !authorize(owner.id, .provide(service: name), { .null }) {
       emitHostEvent(.log(pluginID: owner.id, level: .warn, message: "permission denied: may not provide \(name)"))
       return 0
     }
@@ -670,7 +671,7 @@ public final class PluginHost {
   }
 
   func rawCall(from r: PluginRecord, service: String, method: cordis_bytes, args: cordis_bytes) -> cordis_bytes {
-    if let authorize, !authorize(r.id, .call(service: service, method: CBytes.string(method))) {
+    if let authorize, !authorize(r.id, .call(service: service, method: CBytes.string(method)), { CBytes.value(args) }) {
       return CBytes.owned(Self.error("permission denied: \(r.id) may not call \(service).\(CBytes.string(method))"))
     }
     guard let s = services[service] else {
@@ -711,7 +712,7 @@ public final class PluginHost {
   }
 
   func rawEmit(from r: PluginRecord, event: String, payload: cordis_bytes) {
-    if let authorize, !authorize(r.id, .emit(event: event)) {
+    if let authorize, !authorize(r.id, .emit(event: event), { CBytes.value(payload) }) {
       emitHostEvent(.log(pluginID: r.id, level: .warn, message: "permission denied: may not emit \(event)"))
       return
     }

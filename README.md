@@ -192,7 +192,7 @@ import Cordis
 | `onCrash`, `HostEvent.crashed`, `PluginHost.crashRecovery` | Crash recovery (see below). |
 | `isolation(of:)` | Where a plugin runs (one lookup, cheap enough for per-access policy). |
 | `caller: String?` | The plugin a host service or host listener is serving right now (nil for host-initiated work). Gate host services per plugin with it instead of trusting an argument. |
-| `authorize: ((plugin, PluginAccess) -> Bool)?` | Asked before a plugin calls any service, listens to or emits an event, or provides a service (in-process and out-of-process alike). A refused call returns `{"error": "permission denied: ..."}`, a refused listen or provide returns handle 0, a refused emit is dropped. |
+| `authorize: ((plugin, PluginAccess, args) -> Bool)?` | Asked (with the call's arguments or the emit's payload, decoded lazily) before a plugin calls any service, listens to or emits an event, or provides a service (in-process and out-of-process alike). A refused call returns `{"error": "permission denied: ..."}`, a refused listen or provide returns handle 0, a refused emit is dropped. |
 | `deliver: ((listener, event, payload) -> Bool)?` | Asked before an event reaches a plugin's listener (the payload decodes lazily). Use it to give each plugin only its own async results when results are broadcast events. |
 | `helperExecutable`, `helperTimeout`, `helperFootprint(_:)` | Out-of-process plugins (see below). |
 | `pruneCache()` | Delete cached dylib copies that are not loaded. |

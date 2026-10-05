@@ -20,6 +20,8 @@ public enum PluginIsolation: Equatable, Sendable {
 final class RemotePlugin {
   let pid: pid_t
   let wire: WireConnection
+  /// The write end of the helper's lifeline pipe: the helper exits when this closes (with us).
+  private let lifeline: Int32
   unowned(unsafe) let host: PluginHost
   /// The record this helper serves (set once the manifest is read).
   weak var record: PluginRecord?
@@ -35,9 +37,10 @@ final class RemotePlugin {
   /// considered hung and killed; events and timer ticks get the same budget to be answered.
   var timeoutMs: Int32 { Int32(max(0.01, host.helperTimeout) * 1000) }
 
-  private init(pid: pid_t, fd: Int32, host: PluginHost) {
+  private init(pid: pid_t, fd: Int32, lifeline: Int32, host: PluginHost) {
     self.pid = pid
     wire = WireConnection(fd: fd)
+    self.lifeline = lifeline
     self.host = host
   }
 
@@ -47,12 +50,22 @@ final class RemotePlugin {
       throw .helperFailed("no plugin helper at \(helper)")
     }
     guard let (mine, theirs) = WireConnection.pair() else { throw .helperFailed("socketpair: \(String(cString: strerror(errno)))") }
+    var life: [Int32] = [0, 0]
+    guard pipe(&life) == 0 else {
+      close(mine)
+      close(theirs)
+      throw .helperFailed("pipe: \(String(cString: strerror(errno)))")
+    }
+    // Our ends must not leak into other children (a second helper would keep this one alive).
+    _ = fcntl(mine, F_SETFD, FD_CLOEXEC)
+    _ = fcntl(life[1], F_SETFD, FD_CLOEXEC)
     var actions: posix_spawn_file_actions_t?
     posix_spawn_file_actions_init(&actions)
     posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
     posix_spawn_file_actions_adddup2(&actions, 2, 1)  // plugin output goes to the host's stderr
     posix_spawn_file_actions_adddup2(&actions, 2, 2)
     posix_spawn_file_actions_adddup2(&actions, theirs, 3)
+    posix_spawn_file_actions_adddup2(&actions, life[0], 4)
     var attr: posix_spawnattr_t?
     posix_spawnattr_init(&attr)
     // Close everything else the host has open: the helper inherits only fds 0-3.
@@ -66,11 +79,13 @@ final class RemotePlugin {
     posix_spawn_file_actions_destroy(&actions)
     posix_spawnattr_destroy(&attr)
     close(theirs)
+    close(life[0])
     guard rc == 0 else {
       close(mine)
+      close(life[1])
       throw .helperFailed("posix_spawn \(helper): \(String(cString: strerror(rc)))")
     }
-    let remote = RemotePlugin(pid: pid, fd: mine, host: host)
+    let remote = RemotePlugin(pid: pid, fd: mine, lifeline: life[1], host: host)
     // The first dlopen of a new file is checked by macOS (measured: up to ~700 ms); be generous.
     switch remote.wire.receive(timeoutMs: max(remote.timeoutMs, 10_000)) {
     case let .message(m) where m.first?.int == WireKind.hello.rawValue && m.count >= 3:
@@ -218,6 +233,7 @@ final class RemotePlugin {
     source?.cancel()
     source = nil
     wire.close()
+    if !reaped { close(lifeline) }
     guard !reaped else { return exitSignal ?? 0 }
     reaped = true
     var status: Int32 = 0

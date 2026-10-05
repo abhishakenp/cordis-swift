@@ -9,8 +9,8 @@ extension Fixtures {
 }
 
 @MainActor
-func makeRemoteHost() -> (PluginHost, EventLog) {
-  let (host, log) = makeHost()
+func makeRemoteHost(file: String = #fileID) -> (PluginHost, EventLog) {
+  let (host, log) = makeHost(file: file)
   host.helperExecutable = Fixtures.helperExecutable
   return (host, log)
 }
@@ -160,6 +160,16 @@ struct RemoteTests {
     #expect(log.events.contains { if case .reloaded = $0 { true } else { false } })
     host.unwatch(path)
     host.unloadAll()
+  }
+
+  @Test func aHelperEndsWhenItsHostDies() async throws {
+    // The host process exits while the plugin spins in an event handler.
+    let (status, output) = Fixtures.run(
+      Fixtures.benchExecutable, ["orphan", Fixtures.path("crasher"), Fixtures.helperExecutable])
+    #expect(status == 0, "\(output)")
+    let pid = try #require(output.split(separator: "\n").first { $0.hasPrefix("helper ") }.flatMap { Int32($0.dropFirst(7)) })
+    #expect(pid > 0)
+    #expect(await eventually(timeout: 10) { !processExists(pid) })
   }
 
   @Test func aMissingHelperIsAnError() throws {

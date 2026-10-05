@@ -10,10 +10,11 @@ struct AuthorizeTests {
   func refusedAccessIsDeniedEverywhere(_ isolation: PluginIsolation) throws {
     let (host, _) = makeRemoteHost()
     var asked: [String] = []
-    host.authorize = { plugin, access in
+    host.authorize = { plugin, access, args in
       asked.append(plugin)
       switch access {
       case .call(service: "counter", method: "increment"): return false
+      case .call(service: "counter", method: "echo"): return args()["ok"] == true
       case .emit(event: "secret"): return false
       case .listen(event: "greeter/ping"): return false
       case .provide(service: "greeter"): return true
@@ -26,6 +27,9 @@ struct AuthorizeTests {
     let r = host.call("crasher", "call", ["service": "counter", "method": "increment"])
     #expect(r["error"].string == "permission denied: crasher may not call counter.increment")
     #expect(host.call("crasher", "call", ["service": "counter", "method": "get"]) == 0)
+    // The arguments are there to decide on.
+    #expect(host.call("crasher", "call", ["service": "counter", "method": "echo", "args": ["ok": true]]) == ["ok": true])
+    #expect(host.call("crasher", "call", ["service": "counter", "method": "echo", "args": ["ok": false]])["error"].string != nil)
     // An emit that is refused never reaches anyone; another one does.
     var heard: [String] = []
     host.on("secret") { _ in heard.append("secret") }
@@ -62,7 +66,7 @@ struct AuthorizeTests {
 
   @Test func refusedListenAndProvide() throws {
     let (host, log) = makeHost()
-    host.authorize = { _, access in
+    host.authorize = { _, access, _ in
       access != .listen(event: "crasher/boom") && access != .provide(service: "counter")
     }
     try host.load(Fixtures.path("crasher"))
