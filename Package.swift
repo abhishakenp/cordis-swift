@@ -16,7 +16,7 @@ let package = Package(
     // Value + binary codec. Foundation-free; also compiled into every plugin.
     .target(name: "CordisValue"),
     // Async-signal-safe crash attribution for the host.
-    .target(name: "CCordisHost"),
+    .target(name: "CCordisHost", dependencies: ["CCordis"]),
     // Host runtime.
     .target(name: "Cordis", dependencies: ["CCordis", "CordisValue", "CCordisHost"]),
     // Plugin SDK. Real plugins compile these sources as Embedded Swift via Scripts/cordis-build;

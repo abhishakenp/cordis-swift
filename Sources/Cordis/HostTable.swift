@@ -14,7 +14,7 @@ enum HostTable {
       call: { ctx, service, method, args in
         let r = HostTable.record(ctx)
         return MainActor.assumeIsolated {
-          r.host.rawCall(service: CBytes.string(service), method: method, args: args)
+          r.host.rawCall(from: r, service: CBytes.string(service), method: method, args: args)
         }
       },
       on: { ctx, event, fn, userdata in
@@ -27,7 +27,7 @@ enum HostTable {
       },
       emit: { ctx, event, payload in
         let r = HostTable.record(ctx)
-        MainActor.assumeIsolated { r.host.rawEmit(event: CBytes.string(event), payload: payload) }
+        MainActor.assumeIsolated { r.host.rawEmit(from: r, event: CBytes.string(event), payload: payload) }
       },
       provide: { ctx, service, fn, userdata in
         let r = HostTable.record(ctx)

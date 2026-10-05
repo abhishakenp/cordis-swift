@@ -29,6 +29,8 @@ enum Fixtures {
     Spec(name: "failer", id: "failer", source: "Tests/CordisTests/Fixtures/Failer.swift", defines: []),
     Spec(name: "crasher", id: "crasher", source: "Tests/CordisTests/Fixtures/Crasher.swift", defines: []),
     Spec(name: "crasher-v2", id: "crasher", source: "Tests/CordisTests/Fixtures/Crasher.swift", defines: ["CRASHER_V2"]),
+    Spec(name: "crasher-apply", id: "crasher", source: "Tests/CordisTests/Fixtures/Crasher.swift", defines: ["CRASH_IN_APPLY"]),
+    Spec(name: "dependent", id: "dependent", source: "Tests/CordisTests/Fixtures/Dependent.swift", defines: []),
   ]
 
   /// name -> dylib path

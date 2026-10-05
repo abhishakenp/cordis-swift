@@ -1,4 +1,5 @@
 import CCordis
+import CCordisHost
 import Foundation
 
 /// One loaded plugin image and everything it registered. Owned by `PluginHost`.
@@ -29,6 +30,12 @@ final class PluginRecord {
 
   var phase: Phase = .pending
   var handles: Set<CordisHandle> = []
+  /// The image's __TEXT range: a fault there while this plugin runs is recovered (`cordis_guard_*`).
+  let image: cordis_guard_image
+  /// Set when the plugin's code faulted and the host recovered. From then on nothing calls into it.
+  var crash: Int32?
+  /// How many calls into this plugin are on the stack right now.
+  var frames = 0
 
   /// "<id>\t<buildHash>", read by the crash handler while this plugin's code runs.
   let tag: UnsafeMutablePointer<CChar>
@@ -57,6 +64,7 @@ final class PluginRecord {
     self.disposeFn = disposeFn
     self.probeAddress = probeAddress
     self.phase = phase
+    self.image = probeAddress.map { cordis_guard_image_of($0) } ?? cordis_guard_image(lo: 0, hi: 0)
     self.tag = strdup("\(id)\t\(buildHash)")!
     self.table = .allocate(capacity: 1)
     self.table.initialize(to: HostTable.make(context: nil))

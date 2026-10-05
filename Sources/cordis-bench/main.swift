@@ -1,7 +1,7 @@
 // cordis-bench: micro-benchmarks for the plugin host, plus a crash helper used by the tests.
 //
 //   cordis-bench bench <libcounter.dylib> [calls=1000000] [cycles=100]
-//   cordis-bench crash <plugin.dylib> <marker-path> <service> <method>
+//   cordis-bench crash <plugin.dylib> <marker-path> <service> <method> [recover]
 import Cordis
 import Darwin
 import Foundation
@@ -87,12 +87,14 @@ func bench(_ path: String, calls: Int, cycles: Int) {
 }
 
 @MainActor
-func crash(_ path: String, marker: String, service: String, method: String) {
+func crash(_ path: String, marker: String, service: String, method: String, recover: Bool) {
+  PluginHost.crashRecovery = recover
   let host = PluginHost(crashMarkerPath: marker)
   host.onEvent = { _ in }
   do { try host.load(path) } catch { fail("load failed: \(error)") }
   let result = host.call(service, method, 1)
   print("survived: \(result)")
+  print("state: \(String(describing: host.plugin("crasher")?.state))")
 }
 
 let args = CommandLine.arguments
@@ -103,8 +105,10 @@ case "bench":
   let cycles = args.count > 4 ? Int(args[4]) ?? 100 : 100
   MainActor.assumeIsolated { bench(args[2], calls: calls, cycles: cycles) }
 case "crash":
-  guard args.count == 6 else { fail("usage: cordis-bench crash <dylib> <marker> <service> <method>") }
-  MainActor.assumeIsolated { crash(args[2], marker: args[3], service: args[4], method: args[5]) }
+  guard args.count >= 6 else { fail("usage: cordis-bench crash <dylib> <marker> <service> <method> [recover]") }
+  MainActor.assumeIsolated {
+    crash(args[2], marker: args[3], service: args[4], method: args[5], recover: args.count > 6 && args[6] == "recover")
+  }
 default:
   fail("usage: cordis-bench bench|crash ...")
 }

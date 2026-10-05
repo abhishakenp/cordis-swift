@@ -1,4 +1,9 @@
 @_exported import CordisValue
+#if canImport(Darwin)
+  import Darwin
+#else
+  import Glibc
+#endif
 
 /// Identifies one registration (listener, service, timer). 0 is never a valid handle.
 public typealias CordisHandle = UInt64
@@ -58,6 +63,8 @@ public enum PluginHostError: Error, Equatable, CustomStringConvertible {
   case duplicate(id: String)
   case crashedBuild(id: String, buildHash: String)
   case notLoaded(id: String)
+  /// The plugin's code faulted while the host read its manifest; the host recovered.
+  case crashedWhileLoading(path: String, signal: Int32)
 
   public var description: String {
     switch self {
@@ -69,6 +76,7 @@ public enum PluginHostError: Error, Equatable, CustomStringConvertible {
     case let .duplicate(id): "a plugin with id '\(id)' is already loaded"
     case let .crashedBuild(id, hash): "plugin '\(id)' build \(hash) crashed the host last time; waiting for a new build"
     case let .notLoaded(id): "no plugin with id '\(id)'"
+    case let .crashedWhileLoading(path, signal): "plugin \(path) crashed while loading (\(signalName(signal)))"
     }
   }
 }
@@ -82,4 +90,35 @@ public enum HostEvent: Sendable {
   case unloaded(UnloadReport)
   case reloaded(id: String, buildHash: String)
   case reloadFailed(path: String, reason: String)
+  /// A plugin's code faulted and the host recovered: the plugin was fenced off, its dependents
+  /// disposed, its registrations dropped and its image closed. It stays `.disabled` until it is
+  /// loaded or reloaded again. The process keeps running.
+  case crashed(CrashReport)
+}
+
+/// A plugin fault the host recovered from (see `PluginHost.crashRecovery`).
+public struct CrashReport: Equatable, Sendable {
+  public let id: String
+  public let buildHash: String
+  public let signal: Int32
+  /// The plugin's path (as loaded).
+  public let path: String
+  /// Plugins that were disposed because they injected a service the crashed plugin provided.
+  public let cascaded: [String]
+  /// True when the plugin's image was closed and unmapped (or its helper process exited).
+  public let unmapped: Bool
+}
+
+/// "SIGSEGV", "SIGTRAP", ... for the fault signals cordis handles; "signal N" otherwise.
+public func signalName(_ signal: Int32) -> String {
+  switch signal {
+  case SIGSEGV: "SIGSEGV"
+  case SIGBUS: "SIGBUS"
+  case SIGILL: "SIGILL"
+  case SIGTRAP: "SIGTRAP"
+  case SIGABRT: "SIGABRT"
+  case SIGFPE: "SIGFPE"
+  case SIGKILL: "SIGKILL"
+  default: "signal \(signal)"
+  }
 }

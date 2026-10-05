@@ -55,6 +55,11 @@ public final class PluginHost {
   private var scratchCapacity = 256
   private var callDepth = 0
 
+  // Crash recovery: calls into plugin code on the stack, and plugins that faulted and still have
+  // to be torn down (done as soon as no plugin code is on the stack).
+  private var pluginFrames = 0
+  private var pendingCrashes: [PluginRecord] = []
+
   // MARK: Configuration
 
   /// Receives lifecycle events and plugin log lines. When nil, logs go to stderr.
@@ -66,6 +71,22 @@ public final class PluginHost {
 
   public let crashMarkerPath: String?
   public let cacheDirectory: String
+
+  /// Called after the host recovered from a plugin fault (also reported as `HostEvent.crashed`).
+  public var onCrash: ((CrashReport) -> Void)?
+
+  /// The plugin on whose behalf the host is running right now: set while a host service handles a
+  /// plugin's call and while a host listener handles a plugin's event; nil for host-initiated work.
+  /// Host services use it to enforce per-plugin permissions without trusting an argument.
+  public private(set) var caller: String?
+
+  /// Recover from faults in plugin code (process-wide; see `cordis_guard_*` in CCordisHost):
+  /// a plugin that traps or segfaults is fenced off and unloaded and the call returns an error,
+  /// instead of the whole process crashing. On by default.
+  public static var crashRecovery: Bool {
+    get { cordis_guard_enabled() }
+    set { cordis_guard_set_enabled(newValue) }
+  }
   private var watchers: [String: FileWatcher] = [:]
 
   public static var defaultCacheDirectory: String {
@@ -94,7 +115,9 @@ public final class PluginHost {
   ///   - cacheDirectory: where content-addressed copies of loaded dylibs live
   ///     (default: `~/Library/Caches/cordis-swift/<process>/images`). Reusing it across launches
   ///     matters: macOS checks every new dylib file on its first dlopen, which is slow.
-  public init(crashMarkerPath: String? = PluginHost.defaultCrashMarkerPath, cacheDirectory: String? = nil) {
+  ///   - recoverCrashes: install the fault handlers even without a crash marker, so faults in
+  ///     plugin code are recovered (`crashRecovery`). With a marker they are always installed.
+  public init(crashMarkerPath: String? = PluginHost.defaultCrashMarkerPath, cacheDirectory: String? = nil, recoverCrashes: Bool = true) {
     self.crashMarkerPath = crashMarkerPath
     let cache = cacheDirectory ?? Self.defaultCacheDirectory
     try? FileManager.default.createDirectory(atPath: cache, withIntermediateDirectories: true)
@@ -104,6 +127,8 @@ public final class PluginHost {
         atPath: (marker as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
       lastCrash = Self.readCrashMarker(marker)
       cordis_crash_install(marker)
+    } else if recoverCrashes {
+      cordis_crash_install(nil)
     }
   }
 
@@ -154,13 +179,16 @@ public final class PluginHost {
         i += 1
       }
       Codec.encode(args, into: buf + methodLen)
+      guard let owner = s.owner else { return Self.error("service '\(service)' has no owner") }
+      if owner.crash != nil { return Self.crashedError(owner) }
       callDepth += 1
-      let prev = cordis_crash_swap_current(s.owner.map { UnsafePointer($0.tag) })
-      let result = fn(ud, cordis_bytes(data: buf, len: methodLen), cordis_bytes(data: buf + methodLen, len: argsLen))
-      _ = cordis_crash_swap_current(prev)
+      var result = cordis_bytes(data: nil, len: 0)
+      let ok = guarded(owner) { tag, image in
+        cordis_guard_service(fn, ud, cordis_bytes(data: buf, len: methodLen), cordis_bytes(data: buf + methodLen, len: argsLen), tag, image, &result)
+      }
       callDepth -= 1
       if !reuse { buf.deallocate() }
-      return CBytes.take(result)
+      return ok ? CBytes.take(result) : Self.crashedError(owner)
     }
   }
 
@@ -182,8 +210,10 @@ public final class PluginHost {
       switch l.target {
       case let .host(fn): enter(nil) { fn(payload) }
       case let .plugin(fn, ud):
+        guard let owner = l.owner, owner.crash == nil else { continue }
         if encoded == nil { encoded = Codec.encode(payload) }
-        enter(l.owner) { CBytes.borrow(encoded!) { fn(ud, $0) } }
+        let bytes = encoded!
+        guarded(owner) { tag, image in CBytes.borrow(bytes) { cordis_guard_event(fn, ud, $0, tag, image) } }
       }
     }
   }
@@ -242,11 +272,15 @@ public final class PluginHost {
     guard let dSym = dlsym(dl, "cordis_plugin_dispose") else { throw fail(.missingExport("cordis_plugin_dispose")) }
     let manifestFn = unsafeBitCast(mSym, to: cordis_plugin_manifest_fn.self)
 
-    let manifestTag = strdup("?\t\(hash)")
-    let prev = cordis_crash_swap_current(manifestTag)
-    let manifest = CBytes.take(manifestFn())
-    _ = cordis_crash_swap_current(prev)
+    let manifestTag = strdup("?\t\(hash)")!
+    var manifestBytes = cordis_bytes(data: nil, len: 0)
+    pluginFrames += 1
+    let manifestSignal = cordis_guard_manifest(manifestFn, manifestTag, cordis_guard_image_of(mSym), &manifestBytes)
+    pluginFrames -= 1
     free(manifestTag)
+    // Nothing of this image is registered yet: closing it is all the cleanup a fault needs.
+    if manifestSignal != 0 { throw fail(.crashedWhileLoading(path: path, signal: manifestSignal)) }
+    let manifest = CBytes.take(manifestBytes)
 
     guard let id = manifest["id"].string, !id.isEmpty else { throw fail(.badManifest("missing id")) }
     if let abi = manifest["abi"].int, abi != Int64(CORDIS_ABI_VERSION) { throw fail(.abiMismatch(abi)) }
@@ -357,6 +391,56 @@ public final class PluginHost {
     return CrashRecord(pluginID: parts[0], buildHash: parts[1], signal: sig)
   }
 
+  // MARK: - Internals: crash recovery
+
+  /// One call into plugin code through a `cordis_guard_*` function. Returns false when the plugin
+  /// faulted: it is fenced off at once (nothing calls into it again) and torn down as soon as no
+  /// plugin code is left on the stack, so no frame of it (or of anything it disposes) is still live.
+  @discardableResult
+  @inline(__always)
+  private func guarded(_ r: PluginRecord, _ body: (UnsafePointer<CChar>, cordis_guard_image) -> Int32) -> Bool {
+    r.frames += 1
+    pluginFrames += 1
+    let signal = body(UnsafePointer(r.tag), r.image)
+    r.frames -= 1
+    pluginFrames -= 1
+    if signal != 0, r.crash == nil {
+      r.crash = signal
+      pendingCrashes.append(r)
+      emitHostEvent(.log(pluginID: r.id, level: .error, message: "crashed (\(signalName(signal))); unloading it"))
+    }
+    if pluginFrames == 0, !pendingCrashes.isEmpty { finishCrashes() }
+    return signal == 0
+  }
+
+  private func finishCrashes() {
+    while !pendingCrashes.isEmpty {
+      let r = pendingCrashes.removeFirst()
+      guard records[r.id] === r, r.dl != nil else { continue }
+      let outer = reconciling
+      reconciling = true
+      // Dependents are disposed normally (their dispose runs); the crashed plugin's isn't called.
+      var cascaded: [String] = []
+      if r.phase == .active {
+        cascaded = deactivate(r)
+      }
+      for h in r.handles { removeRegistration(h) }
+      let report = closeImage(r, cascaded: cascaded)
+      r.phase = .disabled("crashed (\(signalName(r.crash ?? 0)))")
+      reconciling = outer
+      let crash = CrashReport(
+        id: r.id, buildHash: r.buildHash, signal: r.crash ?? 0, path: r.path, cascaded: cascaded, unmapped: report.unmapped)
+      emitHostEvent(.unloaded(report))
+      emitHostEvent(.crashed(crash))
+      onCrash?(crash)
+    }
+    if !reconciling { reconcile() }
+  }
+
+  private static func crashedError(_ r: PluginRecord) -> Value {
+    error("plugin '\(r.id)' crashed (\(signalName(r.crash ?? 0)))")
+  }
+
   // MARK: - Internals: execution context
 
   @inline(__always)
@@ -441,34 +525,52 @@ public final class PluginHost {
     guard let reg = registrations[h], case let .timer(_, target) = reg.kind else { return }
     switch target {
     case let .host(fn): enter(nil) { fn(.null) }
-    case let .plugin(fn, ud): enter(reg.owner) { fn(ud, cordis_bytes(data: nil, len: 0)) }
+    case let .plugin(fn, ud):
+      guard let owner = reg.owner, owner.crash == nil else { return }
+      guarded(owner) { tag, image in cordis_guard_event(fn, ud, cordis_bytes(data: nil, len: 0), tag, image) }
     }
     if !repeats { removeRegistration(h) }
   }
 
-  func rawCall(service: String, method: cordis_bytes, args: cordis_bytes) -> cordis_bytes {
+  func rawCall(from r: PluginRecord, service: String, method: cordis_bytes, args: cordis_bytes) -> cordis_bytes {
     guard let s = services[service] else {
       return CBytes.owned(Self.error("service '\(service)' is not available"))
     }
     switch s.target {
     case let .plugin(fn, ud):
       // Plugin to plugin: bytes pass straight through, no decode/encode on the host.
-      return enter(s.owner) { fn(ud, method, args) }
+      guard let owner = s.owner else { return CBytes.owned(Self.error("service '\(service)' has no owner")) }
+      if owner.crash != nil { return CBytes.owned(Self.crashedError(owner)) }
+      var result = cordis_bytes(data: nil, len: 0)
+      let ok = guarded(owner) { tag, image in cordis_guard_service(fn, ud, method, args, tag, image, &result) }
+      return ok ? result : CBytes.owned(Self.crashedError(owner))
     case let .host(fn):
       let m = CBytes.string(method), a = CBytes.value(args)
-      return CBytes.owned(enter(nil) { fn(m, a) })
+      return CBytes.owned(asCaller(r.id) { enter(nil) { fn(m, a) } })
     }
   }
 
-  func rawEmit(event: String, payload: cordis_bytes) {
+  /// Runs host code on behalf of plugin `id` (see `caller`).
+  @inline(__always)
+  func asCaller<R>(_ id: String?, _ body: () -> R) -> R {
+    let previous = caller
+    caller = id
+    defer { caller = previous }
+    return body()
+  }
+
+  func rawEmit(from r: PluginRecord, event: String, payload: cordis_bytes) {
     guard let ls = listeners[event], !ls.isEmpty else { return }
     var decoded: Value?
     for l in ls where registrations[l.handle] != nil {
       switch l.target {
-      case let .plugin(fn, ud): enter(l.owner) { fn(ud, payload) }
+      case let .plugin(fn, ud):
+        guard let owner = l.owner, owner.crash == nil else { continue }
+        guarded(owner) { tag, image in cordis_guard_event(fn, ud, payload, tag, image) }
       case let .host(fn):
         if decoded == nil { decoded = CBytes.value(payload) }
-        enter(nil) { fn(decoded!) }
+        let v = decoded!
+        asCaller(r.id) { enter(nil) { fn(v) } }
       }
     }
   }
@@ -526,7 +628,10 @@ public final class PluginHost {
   private func apply(_ r: PluginRecord) {
     guard let applyFn = r.applyFn else { return }
     r.phase = .active
-    let rc = enter(r) { applyFn(UnsafePointer(r.table)) }
+    var rc: Int32 = -1
+    let table = UnsafePointer(r.table)
+    guarded(r) { tag, image in cordis_guard_apply(applyFn, table, tag, image, &rc) }
+    if r.crash != nil { return }  // torn down as a crash (now, or once the stack unwinds)
     if rc == 0 {
       emitHostEvent(.applied(id: r.id))
       return
@@ -558,8 +663,12 @@ public final class PluginHost {
         cascaded += deactivate(d)
       }
     }
-    if let disposeFn = r.disposeFn { enter(r) { disposeFn() } }
+    // A plugin that faulted is never called again, not even to dispose.
+    if let disposeFn = r.disposeFn, r.crash == nil {
+      guarded(r) { tag, image in cordis_guard_dispose(disposeFn, tag, image) }
+    }
     for h in r.handles { removeRegistration(h) }
+    if r.crash != nil { return cascaded }
     r.phase = .pending
     emitHostEvent(.disposed(id: r.id))
     return cascaded
